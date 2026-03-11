@@ -116,15 +116,18 @@ def cluster_signals(embeddings: np.ndarray, min_cluster_size: int = 3) -> list[l
 
 
 def embed_signals(signals: list) -> np.ndarray:
-    """Embed signals using a text embedding model.
+    """Embed signals using the OpenAI Embeddings API.
 
-    This is a placeholder — in production, call OpenAI/Anthropic embedding API.
+    Falls back to random vectors if LLM_API_KEY is not configured.
     """
-    # TODO: Replace with actual embedding API call
-    # For now, return random embeddings for structural completeness
     texts = [s.text_for_embedding for s in signals]
-    logger.info("Embedding %d signals (placeholder — replace with real model)", len(texts))
-    return np.random.randn(len(texts), 1536).astype(np.float32)
+
+    try:
+        from integrations.embeddings import embed_texts
+        return embed_texts(texts)
+    except (RuntimeError, ImportError) as exc:
+        logger.warning("Embedding API unavailable (%s) — using random vectors", exc)
+        return np.random.randn(len(texts), 1536).astype(np.float32)
 
 
 def scan_horizon() -> list[Theme]:
@@ -181,8 +184,14 @@ def scan_horizon() -> list[Theme]:
         # Determine source mix
         source_mix = {s.source for s in cluster_signals_list}
 
-        # Generate theme label from the first signal (placeholder — use LLM in production)
-        label = cluster_signals_list[0].text_for_embedding[:100]
+        # Generate theme label using LLM (falls back to truncation)
+        try:
+            from integrations.llm import generate_theme_label, synthesize_theme_description
+            signal_texts = [s.text_for_embedding for s in cluster_signals_list]
+            label = generate_theme_label(signal_texts)
+        except Exception as exc:
+            logger.warning("LLM label generation failed (%s) — using text truncation", exc)
+            label = cluster_signals_list[0].text_for_embedding[:100]
 
         # Score novelty against existing themes
         similar_themes = search_themes_by_embedding(centroid, limit=5)
@@ -191,9 +200,17 @@ def scan_horizon() -> list[Theme]:
         # Classify maturity
         maturity = classify_signal_maturity(source_mix)
 
+        # Generate description using LLM (falls back to basic summary)
+        try:
+            description = synthesize_theme_description(
+                label, [s.text_for_embedding for s in cluster_signals_list], maturity
+            )
+        except Exception:
+            description = f"Theme from {len(cluster_signals_list)} signals across {', '.join(source_mix)}"
+
         theme = Theme(
             label=label,
-            description=f"Theme from {len(cluster_signals_list)} signals across {', '.join(source_mix)}",
+            description=description,
             novelty_score=novelty,
             signal_maturity=maturity,
             signal_sources=[s.source_ref for s in cluster_signals_list],

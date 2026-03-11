@@ -106,19 +106,84 @@ def detect_github_signals(username: str) -> list[str]:
     return signals
 
 
-def generate_outreach_draft(profile: FounderProfile) -> str:
-    """Generate a draft outreach message for a high-signal founder.
+def detect_twitter_signals(twitter_handle: str) -> list[str]:
+    """Detect founder signals from Twitter/X activity.
 
-    In production, this would use an LLM for personalized messaging.
+    Args:
+        twitter_handle: Twitter handle (without @).
+
+    Returns:
+        List of detected signal keys.
     """
-    # Placeholder — replace with LLM-generated outreach
-    signals_text = ", ".join(profile.signals_detected)
-    return (
-        f"Hi {profile.name.split()[0]},\n\n"
-        f"I've been following your work and noticed some interesting signals "
-        f"({signals_text}). Would love to chat about what you're building.\n\n"
-        f"Best regards"
-    )
+    signals = []
+
+    try:
+        from integrations.twitter import fetch_user_profile, detect_stealth_bio
+
+        profile = fetch_user_profile(twitter_handle)
+        if profile:
+            stealth = detect_stealth_bio(profile.bio)
+            if stealth:
+                signals.append("twitter_bio_change_to_stealth")
+    except Exception as exc:
+        logger.warning("Twitter signal detection failed for @%s: %s", twitter_handle, exc)
+
+    return signals
+
+
+def detect_scholar_signals(author_name: str) -> list[str]:
+    """Detect founder signals from Semantic Scholar.
+
+    Args:
+        author_name: Researcher name to search for.
+
+    Returns:
+        List of detected signal keys.
+    """
+    signals = []
+
+    try:
+        from integrations.semantic_scholar import (
+            search_authors,
+            get_author_papers,
+            detect_publication_gap,
+        )
+
+        researchers = search_authors(author_name, limit=1)
+        if researchers:
+            papers = get_author_papers(researchers[0].author_id, limit=20, year_min=2023)
+            if papers:
+                signals.append("published_paper_in_theme")
+            if detect_publication_gap(papers):
+                # Publication gap suggests career transition
+                signals.append("ex_tier1_company_departure")
+    except Exception as exc:
+        logger.warning("Semantic Scholar detection failed for %s: %s", author_name, exc)
+
+    return signals
+
+
+def generate_outreach_draft(profile: FounderProfile, theme_label: str | None = None) -> str:
+    """Generate a draft outreach message using LLM.
+
+    Falls back to a template if LLM is unavailable.
+    """
+    try:
+        from integrations.llm import generate_founder_outreach
+        return generate_founder_outreach(
+            founder_name=profile.name,
+            signals_detected=profile.signals_detected,
+            theme_label=theme_label,
+        )
+    except Exception as exc:
+        logger.warning("LLM outreach generation failed (%s) — using template", exc)
+        signals_text = ", ".join(profile.signals_detected)
+        return (
+            f"Hi {profile.name.split()[0]},\n\n"
+            f"I've been following your work and noticed some interesting signals "
+            f"({signals_text}). Would love to chat about what you're building.\n\n"
+            f"Best regards"
+        )
 
 
 def scan_founder(
@@ -144,9 +209,14 @@ def scan_founder(
     """
     all_signals = list(signals)
 
-    # Add GitHub signals if username provided
+    # Add platform-specific signals
     if github_username:
         all_signals.extend(detect_github_signals(github_username))
+    if twitter_handle:
+        all_signals.extend(detect_twitter_signals(twitter_handle))
+
+    # Check Semantic Scholar for academic signals
+    all_signals.extend(detect_scholar_signals(name))
 
     # Deduplicate
     all_signals = list(set(all_signals))

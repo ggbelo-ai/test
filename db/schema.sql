@@ -132,6 +132,68 @@ CREATE INDEX idx_companies_created_at ON companies (created_at DESC);
 CREATE INDEX idx_founders_created_at ON founders (created_at DESC);
 
 -- ============================================================
+-- RPC functions for vector search
+-- ============================================================
+
+-- Semantic similarity search for novelty scoring
+CREATE OR REPLACE FUNCTION match_themes(
+    query_embedding VECTOR(1536),
+    match_count INT DEFAULT 5
+)
+RETURNS TABLE (
+    id UUID,
+    label TEXT,
+    similarity FLOAT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        t.id,
+        t.label,
+        (1 - (t.embedding <=> query_embedding))::FLOAT AS similarity
+    FROM themes t
+    WHERE t.embedding IS NOT NULL
+    ORDER BY t.embedding <=> query_embedding
+    LIMIT match_count;
+END;
+$$;
+
+-- Find founders with expertise in themes similar to a query
+CREATE OR REPLACE FUNCTION match_founders_by_theme(
+    query_embedding VECTOR(1536),
+    min_signal_score INT DEFAULT 20,
+    match_count INT DEFAULT 10
+)
+RETURNS TABLE (
+    founder_id UUID,
+    founder_name TEXT,
+    signal_score INT,
+    theme_label TEXT,
+    theme_similarity FLOAT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        f.id AS founder_id,
+        f.name AS founder_name,
+        f.signal_score,
+        t.label AS theme_label,
+        (1 - (t.embedding <=> query_embedding))::FLOAT AS theme_similarity
+    FROM founders f
+    JOIN founder_expert_in_theme fet ON f.id = fet.founder_id
+    JOIN themes t ON fet.theme_id = t.id
+    WHERE f.signal_score >= min_signal_score
+      AND t.embedding IS NOT NULL
+    ORDER BY t.embedding <=> query_embedding
+    LIMIT match_count;
+END;
+$$;
+
+-- ============================================================
 -- Updated-at trigger
 -- ============================================================
 

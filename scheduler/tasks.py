@@ -20,7 +20,7 @@ def run_horizon_scanner() -> dict:
 
     for theme in themes:
         route_task("new_theme", {
-            "id": None,  # Will be set after DB insert in scan_horizon
+            "id": None,
             "label": theme.label,
             "novelty_score": theme.novelty_score,
             "signal_maturity": theme.signal_maturity,
@@ -39,14 +39,10 @@ def run_founder_radar() -> dict:
 
     logger.info("Celery: starting Founder Radar")
 
-    # In production, this would iterate over tracked individuals
-    # from Twitter/X lists, GitHub watchlists, etc.
-    # For now, this is a placeholder structure.
+    # Build tracked profiles from multiple data sources
+    tracked_profiles = _gather_tracked_profiles()
+
     high_signal_count = 0
-
-    # Example: would be populated by monitoring pipelines
-    tracked_profiles: list[dict] = []
-
     for profile in tracked_profiles:
         result = scan_founder(
             name=profile["name"],
@@ -54,6 +50,7 @@ def run_founder_radar() -> dict:
             theme_id=profile.get("theme_id"),
             twitter_handle=profile.get("twitter_handle"),
             github_username=profile.get("github_username"),
+            linkedin_url=profile.get("linkedin_url"),
         )
 
         if result.signal_score >= SIGNAL_SCORE_THRESHOLD:
@@ -68,3 +65,93 @@ def run_founder_radar() -> dict:
             high_signal_count += 1
 
     return {"profiles_scanned": len(tracked_profiles), "high_signal": high_signal_count}
+
+
+def _gather_tracked_profiles() -> list[dict]:
+    """Gather founder profiles to scan from multiple data sources.
+
+    Combines:
+    1. Existing founders in the knowledge graph that need re-scoring
+    2. GitHub contributors to trending repos in active themes
+    3. Semantic Scholar researchers in relevant fields
+
+    Returns:
+        List of profile dicts ready for scan_founder().
+    """
+    profiles: list[dict] = []
+    seen_names: set[str] = set()
+
+    # 1. Pull existing founders from knowledge graph that need re-scoring
+    try:
+        from db.supabase_client import list_founders
+        existing_founders = list_founders(limit=100)
+        for f in existing_founders:
+            if f.get("partner_decision") != "pass":
+                profiles.append({
+                    "name": f["name"],
+                    "signals": f.get("signals_detected", []),
+                    "twitter_handle": f.get("twitter_handle"),
+                    "github_username": f.get("github_username"),
+                    "linkedin_url": f.get("linkedin_url"),
+                })
+                seen_names.add(f["name"])
+    except Exception as exc:
+        logger.warning("Failed to load existing founders: %s", exc)
+
+    # 2. Discover new profiles from GitHub trending repos
+    try:
+        from integrations.github import fetch_github_trending
+        trending = fetch_github_trending(stars_growth_pct_min=50, max_results=20)
+
+        for repo in trending:
+            owner = repo.repo_full_name.split("/")[0]
+            if owner not in seen_names:
+                profiles.append({
+                    "name": owner,
+                    "signals": ["open_source_repo_created"],
+                    "github_username": owner,
+                })
+                seen_names.add(owner)
+    except Exception as exc:
+        logger.warning("Failed to gather GitHub profiles: %s", exc)
+
+    # 3. Scan Semantic Scholar for researchers in active theme areas
+    try:
+        from db.supabase_client import list_themes
+        from integrations.semantic_scholar import search_authors
+
+        active_themes = list_themes(status="active", limit=5)
+
+        for theme in active_themes:
+            researchers = search_authors(theme["label"], limit=5)
+            for r in researchers:
+                if r.name not in seen_names:
+                    profiles.append({
+                        "name": r.name,
+                        "signals": ["published_paper_in_theme"],
+                        "theme_id": theme["id"],
+                    })
+                    seen_names.add(r.name)
+    except Exception as exc:
+        logger.warning("Failed to gather Semantic Scholar profiles: %s", exc)
+
+    logger.info("Gathered %d tracked profiles for Founder Radar", len(profiles))
+    return profiles
+
+
+@app.task(name="scheduler.tasks.run_market_cartographer")
+def run_market_cartographer(theme_id: str, theme_label: str) -> dict:
+    """On-demand task: build a market map for a specific theme."""
+    import asyncio
+
+    from agents.market_cartographer import build_market_map
+
+    logger.info("Celery: building market map for '%s'", theme_label)
+    market_map = asyncio.run(build_market_map(theme_id, theme_label))
+
+    return {
+        "theme_id": theme_id,
+        "company_count": market_map.company_count,
+        "tam_estimate": market_map.tam_estimate,
+        "tam_confidence": market_map.tam_confidence,
+    }

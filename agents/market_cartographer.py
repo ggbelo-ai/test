@@ -61,6 +61,15 @@ async def build_market_map(theme_id: str, theme_label: str) -> MarketMap:
     yc_companies = await scrape_yc_companies(keywords=theme_label, max_results=30)
     logger.info("Found %d YC companies for '%s'", len(yc_companies), theme_label)
 
+    # 1b. Scrape Tracxn for additional company data
+    tracxn_companies = []
+    try:
+        from integrations.tracxn import scrape_tracxn_companies
+        tracxn_companies = await scrape_tracxn_companies(keywords=theme_label, max_results=20)
+        logger.info("Found %d Tracxn companies for '%s'", len(tracxn_companies), theme_label)
+    except Exception as exc:
+        logger.warning("Tracxn scraper failed: %s", exc)
+
     # 2. Search OpenCorporates
     oc_companies = search_opencorporates(theme_label, max_results=20)
     logger.info("Found %d OpenCorporates results for '%s'", len(oc_companies), theme_label)
@@ -122,6 +131,29 @@ async def build_market_map(theme_id: str, theme_label: str) -> MarketMap:
             source="opencorporates",
             geography=oc.jurisdiction,
             metadata={"incorporation_date": oc.incorporation_date},
+        )
+        link_company_to_theme(db_company["id"], theme_id)
+
+    # Process Tracxn companies (mixed stage)
+    for tc in tracxn_companies:
+        company_data = {
+            "name": tc.name,
+            "description": tc.description,
+            "sector": tc.sector,
+            "location": tc.location,
+            "source": "tracxn",
+        }
+        # Tracxn companies could be early or growth stage
+        if tc.stage and "series" in tc.stage.lower():
+            growth_stage.append(company_data)
+        else:
+            early_stage.append(company_data)
+
+        db_company = insert_company(
+            name=tc.name,
+            source="tracxn",
+            sector=tc.sector,
+            metadata={"description": tc.description, "tracxn_url": tc.tracxn_url},
         )
         link_company_to_theme(db_company["id"], theme_id)
 
