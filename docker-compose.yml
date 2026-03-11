@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  conviction-engine:
+    build: .
+    env_file: .env
+    depends_on:
+      - redis
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: celery -A scheduler.celery_app worker --beat --loglevel=info
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
