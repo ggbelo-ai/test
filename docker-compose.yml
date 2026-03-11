@@ -1,22 +1,72 @@
 version: "3.9"
 
-services:
-  conviction-engine:
-    build: .
-    env_file: .env
-    depends_on:
-      - redis
-    volumes:
-      - .:/app
-    working_dir: /app
-    command: celery -A scheduler.celery_app worker --beat --loglevel=info
+x-app-common: &app-common
+  build: .
+  env_file: .env
+  depends_on:
+    redis:
+      condition: service_healthy
+  volumes:
+    - .:/app
+  working_dir: /app
+  restart: unless-stopped
 
+services:
+  # Celery worker — executes agent tasks
+  worker:
+    <<: *app-common
+    command: >
+      celery -A scheduler.celery_app worker
+      --loglevel=info
+      --concurrency=2
+      -Q default,horizon,cartographer,founder
+    healthcheck:
+      test: ["CMD", "celery", "-A", "scheduler.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery beat — triggers scheduled tasks
+  beat:
+    <<: *app-common
+    command: >
+      celery -A scheduler.celery_app beat
+      --loglevel=info
+      --schedule=/tmp/celerybeat-schedule
+    # Only one beat instance should run
+    deploy:
+      replicas: 1
+
+  # Telegram bot — handles inline button callbacks
+  telegram-bot:
+    <<: *app-common
+    command: python -m notifications.telegram_bot
+    deploy:
+      replicas: 1
+
+  # Flower — Celery monitoring dashboard
+  flower:
+    <<: *app-common
+    command: >
+      celery -A scheduler.celery_app flower
+      --port=5555
+      --broker_api=redis://redis:6379/0
+    ports:
+      - "5555:5555"
+
+  # Redis — message broker and result backend
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
 volumes:
   redis_data:

@@ -18,4 +18,5 @@ RUN playwright install chromium
 
 COPY . .
 
-CMD ["celery", "-A", "scheduler.celery_app", "worker", "--beat", "--loglevel=info"]
+# Default: run Celery worker
+CMD ["celery", "-A", "scheduler.celery_app", "worker", "--loglevel=info"]
