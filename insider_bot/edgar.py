@@ -266,11 +266,16 @@ def refresh_universe_transactions(
     client = EdgarClient()
     universe = list(universe) if universe else list(config.UNIVERSE.keys())
     out: list[InsiderTxn] = []
+    seen_ciks: set[str] = set()  # multiple tickers can share one issuer CIK (e.g. GOOGL/GOOG)
     for ticker in universe:
         cik = client.cik_for(ticker)
         if not cik:
             log.info("no CIK for %s", ticker)
             continue
+        if cik in seen_ciks:
+            log.info("skipping %s: CIK %s already fetched", ticker, cik)
+            continue
+        seen_ciks.add(cik)
         try:
             filings = client.list_form4_filings(cik, since=since)
         except Exception as exc:

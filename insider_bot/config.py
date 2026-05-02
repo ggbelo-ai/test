@@ -67,7 +67,7 @@ UNIVERSE: dict[str, str] = {
     "OKTA": "Okta",
     "ROKU": "Roku",
     "COIN": "Coinbase",
-    "SQ": "Block",
+    "XYZ": "Block",  # formerly SQ; ticker changed in 2025
 }
 
 # Signal parameters.

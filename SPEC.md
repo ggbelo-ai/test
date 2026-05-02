@@ -132,7 +132,7 @@ currently attempt to reconstruct historical index membership.
 | OKTA | Okta |
 | ROKU | Roku |
 | COIN | Coinbase |
-| SQ | Block |
+| XYZ | Block |
 
 The universe should be viewed as a first operating set, not a final research
 universe. The current list likely contains survivorship bias for historical
