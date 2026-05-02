@@ -1,594 +1,396 @@
-# Conviction Engine — Technical Specification v2.0
-
-> Revised: Free data sources · Telegram notifications · Simplified infrastructure
-
----
-
-## Executive Summary
-
-The **Conviction Engine** is a multi-agent AI system designed to generate alpha in venture capital by identifying emerging market themes, mapping competitive landscapes, and surfacing high-signal founders before consensus forms around investment opportunities.
-
-Unlike existing VC tools that accelerate existing workflows (deal flow management, CRM), this system is designed to compress the time between a market shift emerging and a partner forming a high-conviction investment thesis. It operates autonomously on a daily/weekly cadence, continuously building a proprietary knowledge graph that becomes more valuable over time.
-
-**Core Value Proposition:** A 2-person investment team can operate with the sourcing breadth and pattern recognition of a 10-person firm, while focusing human capital entirely on relationships and conviction calls rather than research prep.
-
----
-
-## Key Design Principles
-
-### 1. Novelty Over Volume
-The system explicitly filters for novel themes (novelty score > 0.70) rather than surfacing every possible signal. This prevents noise and ensures partners only see genuinely early insights.
-
-### 2. Signal Maturity, Not Time Predictions
-Rather than predicting hard commercialisation windows (e.g. "18–36 months"), the system classifies each theme by its current **signal maturity** — how far along the academic → open-source → commercial pipeline it sits. This is honest, actionable, and avoids false precision.
-
-### 3. Compounding Knowledge Graph
-Every theme explored, every founder tracked, every market mapped enriches the graph. Over time the system develops a proprietary thesis fingerprint — it learns which early signals historically preceded breakout companies in your specific portfolio. This is the moat.
-
-### 4. Human-in-the-Loop at Decision Points
-Agents run autonomously for data collection and synthesis. Partners only intervene at decision points: reach out to founder, deep-dive on theme, pass. Telegram inline buttons feed decisions back into the Living Investment Memo without manual data entry.
-
-### 5. Thesis-Driven, Not Deal-Driven
-Traditional deal flow systems are reactive: founders reach out, you evaluate. This system is proactive: it discovers where markets are heading, maps the landscape, identifies the best founders — then you reach out when conviction is high.
-
----
-
-## System Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  ORCHESTRATOR AGENT                  │
-│    (routing  +  Living Investment Memo  +  Telegram) │
-└──────────────┬──────────────┬───────────────┬────────┘
-               │              │               │
-          [Agent 1]      [Agent 2]       [Agent 3]
-          Horizon         Market          Founder
-          Scanner       Cartographer      Radar
-               │              │               │
-               └──────────────┴───────────────┘
-                              │
-               ┌──────────────▼──────────────┐
-               │  KNOWLEDGE GRAPH            │
-               │  Supabase (PostgreSQL +     │
-               │  pgvector)                  │
-               └─────────────────────────────┘
-```
-
-### Technology Stack
-
-| Layer | Technology | Notes |
-|---|---|---|
-| Agent orchestration | LangGraph (Python) | Stateful multi-agent coordination |
-| Vector store | pgvector on Supabase | Free — eliminates Pinecone cost |
-| Relational DB | Supabase PostgreSQL | Free tier; stores Living Investment Memo |
-| Graph queries | Supabase (v1) | Upgrade to Neo4j only once >500 entities |
-| Data ingestion | arXiv API, GitHub API, USPTO, pytrends, Playwright | All free |
-| Company data | YC company list, OpenCorporates, Tracxn scraping | Replaces paid Crunchbase |
-| Job scheduling | Celery + Redis | Daily/weekly agent triggers |
-| Notifications | Telegram Bot (`python-telegram-bot`) | Replaces Slack; supports inline decision buttons |
-
----
-
-## Agent Specifications
-
-### Agent 1 — Horizon Scanner
-
-**Role:** Continuously scans for weak signals in emerging technology and market themes before they appear in startup databases.
-
-**Schedule:** Daily at 06:00 UTC via Celery
-
-**Escalation:** Routes to Orchestrator if `novelty_score > 0.70`
-
-#### Data Sources (all free)
-- **arXiv API** — papers in cs.AI, cs.RO, q-bio, eess; tracks citation velocity
-- **GitHub API** — repositories gaining >200 stars/week from base <1,000 stars
-- **USPTO Patent API** — new filings by technology classification
-- **pytrends** (Google Trends) — keyword acceleration curves; free, no API key required
-
-#### Signal Maturity Classification
-
-Rather than predicting commercialisation timelines, each theme receives a `signal_maturity` classification derived from which source layers are firing:
-
-| Maturity Level | Signal Mix |
-|---|---|
-| `pre_commercial` | arXiv only — academic attention, no product activity |
-| `early_commercial` | arXiv + GitHub — researchers building tools, first OSS repos |
-| `accelerating` | All sources firing + first companies appearing in YC/OpenCorporates |
-| `crowded` | High company count, mainstream press coverage detected |
-
-#### Core Algorithm
-
-1. Fetch signals from each source (last 24 hours)
-2. Embed signals using a text embedding model
-3. Cluster with HDBSCAN to identify emerging themes
-4. Score novelty by comparing each theme against the existing knowledge graph (pgvector cosine similarity)
-5. Assign `signal_maturity` based on source mix
-6. Route to Orchestrator if `novelty_score > 0.70`
-
-#### Implementation Pseudocode
-
-```python
-def scan_horizon():
-    signals = []
-    signals += fetch_arxiv_papers(last_days=1, citation_velocity_min=10)
-    signals += fetch_github_trending(stars_growth_pct_min=30)
-    signals += fetch_patent_filings(last_days=7)
-    signals += fetch_pytrends_acceleration(keywords=active_theme_labels)
-
-    embeddings = embed_signals(signals)
-    themes = cluster_embeddings(embeddings, method="HDBSCAN")
-
-    for theme in themes:
-        novelty = compare_to_knowledge_graph(theme)  # pgvector cosine similarity
-        maturity = classify_signal_maturity(theme.source_mix)
-        if novelty > 0.70:
-            orchestrator.route_task("new_theme", theme, maturity)
-```
-
-#### Output Schema
-
-```json
-{
-  "theme_id": "uuid",
-  "label": "Neuromorphic edge inference",
-  "signal_sources": ["arxiv:2401.xxxxx", "github:org/repo"],
-  "novelty_score": 0.84,
-  "signal_maturity": "early_commercial",
-  "related_existing_theses": ["theme_id_2"]
-}
-```
-
----
-
-### Agent 2 — Market Cartographer
-
-**Role:** Takes an emerging theme and builds a structured market map — TAM estimates, competitive landscape segmentation, and incumbent tracking.
-
-**Trigger:** On-demand, called by Orchestrator when a new theme is confirmed as novel.
-
-#### Data Sources (all free)
-- **Y Combinator company list** (public) — best free source for early-stage companies by theme
-- **OpenCorporates free tier** — company registration data
-- **Tracxn free snippets** — scraped via Playwright
-- **SEC EDGAR** — S-1 filings for public company comparables and real disclosed revenue figures
-- **GitHub organisation count** — number of orgs with repos in the theme as a crowding proxy
-
-#### TAM Estimation Approach
-
-Web-scraped analyst reports produce unreliable, SEO-inflated market size figures. The Cartographer instead uses a bottom-up approach:
-
-1. Find 2–3 public companies in adjacent markets via SEC EDGAR
-2. Use their disclosed segment revenues as a proxy for addressable market
-3. Cross-reference with company count across YC batches as a market momentum indicator
-4. Flag TAM estimate confidence as `low` / `medium` / `high` based on data availability
-
-#### Implementation Pseudocode
-
-```python
-def build_market_map(theme):
-    companies = scrape_yc_companies(keywords=theme.label, founded_after="2020-01-01")
-    companies += search_opencorporates(theme.label)
-
-    public_comps = fetch_edgar_comparables(theme.label)
-    tam_estimate = estimate_tam_from_edgar(public_comps)
-
-    competitive_map = {
-        "theme_id": theme.id,
-        "tam_estimate": tam_estimate,
-        "tam_confidence": rate_confidence(public_comps),
-        "early_stage": [c for c in companies if c.stage in ["pre-seed", "seed"]],
-        "growth_stage": [c for c in companies if c.stage in ["series_a", "series_b"]],
-        "incumbents": public_comps
-    }
-
-    return competitive_map
-```
-
-#### Output
-
-A `MarketMap` record stored in Supabase with JSON arrays for companies by stage, TAM estimates with confidence flags, and public comparables.
-
----
-
-### Agent 3 — Founder Radar
-
-**Role:** Tracks high-signal founders before they announce a company — monitoring career transitions, research outputs, and behavioural signals.
-
-**Schedule:** Weekly + on-demand when a new theme is created.
-
-**Escalation:** Routes to Orchestrator if `signal_score > 40`
-
-#### Data Sources (all free)
-- **Twitter/X API** — bio changes, follower graph, engagement patterns of domain experts
-- **GitHub API** — solo contributors to high-growth repositories; new repo creation by tracked individuals
-- **Semantic Scholar** — researchers leaving PhD/postdoc positions in relevant fields
-- **LinkedIn** (cautious Playwright scraping) — public profile pages only, no authenticated scraping
-
-> **Note on LinkedIn monitoring:** Without Proxycurl, LinkedIn signal quality is reduced. The system compensates by weighting Twitter/X and GitHub signals more heavily. Domain purchase detection has been removed — WHOIS privacy is now standard and produces too many false negatives.
-
-#### Signal Scoring
-
-```python
-FOUNDER_SIGNALS = {
-    "repeat_founder":                 25,  # Previously exited a company
-    "twitter_bio_change_to_stealth":  20,  # Changed bio to "Building something new"
-    "ex_tier1_company_departure":     15,  # Left DeepMind, OpenAI, Stripe, etc.
-    "published_paper_in_theme":       12,  # Academic authority in the theme
-    "open_source_repo_created":       10,  # Started new technical project
-    "github_contribution_spike":       8,  # Sudden activity increase on theme repos
-}
-
-def score_founder(profile):
-    score = sum(FOUNDER_SIGNALS[s] for s in profile.signals if s in FOUNDER_SIGNALS)
-    if score > 40:
-        orchestrator.escalate_to_telegram(profile, reason="High-signal founder detected")
-    return score
-```
-
-#### Output Schema
-
-```json
-{
-  "founder_id": "uuid",
-  "name": "Jane Smith",
-  "signal_score": 67,
-  "signals_detected": ["repeat_founder", "twitter_bio_change_to_stealth"],
-  "likely_theme": "theme_id_3",
-  "recommended_action": "reach_out_now",
-  "draft_outreach": "Hi Jane, noticed you recently left DeepMind..."
-}
-```
-
----
-
-### Orchestrator Agent
-
-**Role:** Lightweight coordinator that routes tasks to sub-agents, merges outputs, maintains the Living Investment Memo, and escalates high-conviction findings to partners via Telegram.
-
-#### Escalation Logic
-- Theme `novelty_score > 0.75` → send Telegram theme card
-- Founder `signal_score > 40` → send Telegram founder card
-- Otherwise → log to knowledge graph, continue monitoring
-
-#### System Prompt
-
-```
-You are a VC investment orchestrator. You maintain a Living Investment Memo —
-a structured JSON document of active theses and tracked founders. When a
-sub-agent returns output:
-1. Determine if it confirms, extends, or contradicts an existing thesis
-2. Update the memo accordingly
-3. Classify the signal_maturity of each theme based on source mix
-4. If novelty/signal exceeds threshold, send a Telegram alert
-Always synthesise into investment-grade language. Never surface raw data.
-```
-
-#### Telegram Card Format
-
-Each notification includes inline keyboard buttons that write the partner's decision back to the Living Investment Memo:
-
-| Card Type | Inline Buttons |
-|---|---|
-| Theme card | 🔍 Deep-dive · 👀 Watch · ❌ Pass |
-| Founder card | 📧 Draft outreach · 👀 Watch · ❌ Pass |
-
----
-
-## Knowledge Graph Schema
-
-Persistent institutional memory layer. Implemented in **Supabase (PostgreSQL + pgvector)** for v1. Migrate to Neo4j AuraDB only when entity count exceeds ~500 and graph traversal queries become a bottleneck.
-
-### Tables
-
-```sql
--- Core entities
-CREATE TABLE themes (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    label TEXT NOT NULL,
-    novelty_score FLOAT,
-    signal_maturity TEXT CHECK (signal_maturity IN ('pre_commercial','early_commercial','accelerating','crowded')),
-    status TEXT CHECK (status IN ('emerging','active','crowded')),
-    embedding VECTOR(1536),  -- pgvector column
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE companies (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT NOT NULL,
-    url TEXT,
-    stage TEXT,
-    sector TEXT,
-    geography TEXT,
-    founded_date DATE,
-    source TEXT,  -- 'yc', 'opencorporates', 'tracxn'
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE founders (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT NOT NULL,
-    linkedin_url TEXT,
-    twitter_handle TEXT,
-    signal_score INT DEFAULT 0,
-    signals_detected TEXT[],
-    partner_decision TEXT,  -- 'reach_out', 'watching', 'pass'
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Junction tables (relationships)
-CREATE TABLE founder_founded_company   (founder_id UUID, company_id UUID);
-CREATE TABLE company_operates_in_theme (company_id UUID, theme_id UUID);
-CREATE TABLE theme_related_to_theme    (theme_id_a UUID, theme_id_b UUID, similarity_score FLOAT);
-CREATE TABLE founder_expert_in_theme   (founder_id UUID, theme_id UUID);
-```
-
-### Vector Search (pgvector)
-
-Novelty scoring uses cosine similarity against existing theme embeddings — no separate Pinecone index required:
-
-```sql
-SELECT id, label, 1 - (embedding <=> $new_embedding) AS similarity
-FROM themes
-ORDER BY similarity DESC
-LIMIT 5;
-```
-
----
-
-## Living Investment Memo
-
-A structured JSON document stored in Supabase serving as the central state object. Updated continuously by the Orchestrator as agents return outputs.
-
-### Schema
-
-```json
-{
-  "last_updated": "2026-03-11T06:00:00Z",
-  "active_theses": [
-    {
-      "theme_id": "uuid",
-      "label": "Agentic infrastructure for regulated industries",
-      "novelty_score": 0.84,
-      "signal_maturity": "early_commercial",
-      "companies_tracked": 7,
-      "watch_list_founders": 3,
-      "key_risks": ["EU regulatory uncertainty", "OpenAI competing directly"],
-      "status": "emerging"
-    }
-  ],
-  "watch_list_founders": [
-    {
-      "name": "Jane Smith",
-      "signal_score": 67,
-      "likely_theme": "uuid",
-      "recommended_action": "reach_out_now",
-      "partner_decision": "watching"
-    }
-  ]
-}
-```
-
-### Update Triggers
-- Horizon Scanner discovers new theme → adds to `active_theses`
-- Market Cartographer maps companies → updates `companies_tracked`
-- Founder Radar scores profile > 40 → adds to `watch_list_founders`
-- Partner taps Telegram inline button → updates `partner_decision` field
-
----
-
-## Operational Workflow
-
-### Daily Cycle (Automated)
-
-| Time (UTC) | Action |
-|---|---|
-| 06:00 | Horizon Scanner wakes — fetches arXiv, GitHub, USPTO, pytrends signals from last 24h |
-| 06:05 | Embeds + clusters signals → HDBSCAN themes → scores novelty via pgvector |
-| 06:10 | Themes with novelty > 0.70 routed to Orchestrator |
-| 06:12 | Orchestrator triggers Market Cartographer for each novel theme |
-| 06:15 | Market Cartographer searches YC list, OpenCorporates, EDGAR → builds MarketMap |
-| 06:25 | If novelty > 0.75 → Telegram theme card sent with inline buttons |
-
-### Weekly Cycle (Automated)
-
-| Time (UTC) | Action |
-|---|---|
-| Mon 08:00 | Founder Radar wakes — scans Twitter/X bios, GitHub repos, Semantic Scholar |
-| Mon 08:15 | Scores each profile using signal weights |
-| Mon 08:20 | Profiles scoring > 40 routed to Orchestrator |
-| Mon 08:25 | Orchestrator matches founder expertise to active theses in Living Investment Memo |
-| Mon 08:30 | Generates draft outreach → sends Telegram founder card with inline buttons |
-
----
-
-## Build Phases
-
-### Phase 1 — Infrastructure (Weeks 1–2)
-
-**Objective:** Set up data layer and integrations.
-
-- [ ] Provision Supabase PostgreSQL instance — enable pgvector extension
-- [ ] Define schema: themes, companies, founders tables + junction tables
-- [ ] Build Living Investment Memo read/write layer (CRUD in Python)
-- [ ] Set up API integrations: arXiv, GitHub, USPTO, pytrends (all free; only GitHub needs a token)
-- [ ] Set up Telegram bot via BotFather — configure inline keyboard callback handlers
-- [ ] Implement Playwright scraper for YC company list and Tracxn snippets
-
-**Success Criteria:** Can write a test theme to Supabase, retrieve it via pgvector semantic search, and send a test Telegram message with functional inline buttons.
-
----
-
-### Phase 2 — Agent Development (Weeks 3–5)
-
-**Objective:** Build and test each agent independently before integration.
-
-#### Week 3: Horizon Scanner
-- [ ] Implement arXiv paper fetcher (filter by category, citation velocity)
-- [ ] Implement GitHub trending repo fetcher (stars/week growth rate)
-- [ ] Implement USPTO patent fetcher (technology classification codes)
-- [ ] Integrate pytrends for keyword acceleration curves
-- [ ] Build embedding + clustering pipeline (text → vectors → HDBSCAN → theme labels)
-- [ ] Build novelty scoring (compare theme embedding to existing themes via pgvector)
-- [ ] Build `signal_maturity` classifier based on source mix
-- [ ] Test: input 100 papers from Jan 2024 — verify it surfaces themes that became crowded by Jan 2025
-
-#### Week 4: Market Cartographer
-- [ ] Implement YC company list scraper (filtered by founding date, employee count)
-- [ ] Implement OpenCorporates free tier search
-- [ ] Implement SEC EDGAR comparable revenue fetcher
-- [ ] Build TAM estimation logic with confidence flagging (`low` / `medium` / `high`)
-- [ ] Build competitive segmentation (sort by stage, identify public comps)
-- [ ] Test with 3 known themes: "AI coding assistants", "vertical SaaS healthcare", "climate fintech"
-
-#### Week 5: Founder Radar + Orchestrator
-- [ ] Implement Twitter/X monitoring (bio text changes, follower graph shifts)
-- [ ] Implement GitHub monitoring (new repos, contribution patterns of tracked individuals)
-- [ ] Implement Semantic Scholar researcher departure detection
-- [ ] Implement cautious LinkedIn public-page scraper via Playwright
-- [ ] Build signal scoring system with configurable weights
-- [ ] Build Orchestrator: task routing, Living Investment Memo merge logic, escalation thresholds
-- [ ] Build Telegram notification formatter + inline button callback handlers
-- [ ] Wire all agents into orchestrator graph using LangGraph
-
-**Success Criteria:** Manually trigger each agent, receive structured output, see it merged into Living Investment Memo, and receive Telegram card with working decision buttons.
-
----
-
-### Phase 3 — Scheduling + Deployment (Week 6)
-
-**Objective:** Automate end-to-end workflow and deploy.
-
-- [ ] Set up Celery + Redis for task scheduling
-- [ ] Configure daily cron for Horizon Scanner (06:00 UTC)
-- [ ] Configure weekly cron for Founder Radar (Monday 08:00 UTC)
-- [ ] Deploy via Docker Compose (single cloud instance)
-- [ ] Run end-to-end integration test: seed 5 weak signals → verify full pipeline → receive Telegram card
-- [ ] Run 7-day autonomous test — zero manual intervention required
-
-**Success Criteria:** System runs autonomously for 7 days. At least one novel theme surfaced and mapped. At least one founder card delivered with functional decision buttons.
-
----
-
-## Environment Variables
-
-```bash
-# LLM Provider
-LLM_API_KEY=
-
-# Supabase (PostgreSQL + pgvector — replaces Pinecone + Neo4j)
-SUPABASE_URL=https://xxxxx.supabase.co
-SUPABASE_ANON_KEY=
-
-# Free Data Sources
-GITHUB_TOKEN=           # Free — needed for higher rate limits
-
-# Notifications
-TELEGRAM_BOT_TOKEN=     # From BotFather
-TELEGRAM_CHAT_ID=       # Your personal or group chat ID
-
-# Task Queue
-REDIS_URL=redis://localhost:6379
-```
-
-> **Removed vs original spec:** `PINECONE_API_KEY`, `NEO4J_*`, `CRUNCHBASE_API_KEY`, `PROXYCURL_API_KEY`, `APIFY_TOKEN`, `SERPER_API_KEY`, `SLACK_BOT_TOKEN` — all eliminated. The only paid dependency is your LLM provider.
-
----
-
-## Repository Structure
-
-```
-conviction-engine/
-├── agents/
-│   ├── orchestrator.py            # Central coordinator
-│   ├── horizon_scanner.py         # Theme discovery from weak signals
-│   ├── market_cartographer.py     # Competitive landscape mapping
-│   └── founder_radar.py           # Founder signal tracking
-│
-├── db/
-│   ├── supabase_client.py         # Connection + query helpers
-│   ├── schema.sql                 # Table + pgvector definitions
-│   └── living_memo.py             # Living Investment Memo CRUD
-│
-├── integrations/
-│   ├── arxiv.py
-│   ├── github.py
-│   ├── uspto.py
-│   ├── pytrends_client.py
-│   ├── yc_scraper.py              # YC company list
-│   ├── opencorporates.py
-│   ├── edgar.py
-│   └── linkedin_scraper.py        # Playwright, public pages only
-│
-├── notifications/
-│   └── telegram.py                # Card formatting + inline button callbacks
-│
-├── scheduler/
-│   ├── celery_app.py
-│   └── tasks.py
-│
-├── tests/
-│   ├── test_horizon_scanner.py
-│   ├── test_market_cartographer.py
-│   ├── test_founder_radar.py
-│   └── test_orchestrator.py
-│
-├── docker-compose.yml
-├── .env.example
-├── requirements.txt
-└── README.md
-```
-
----
-
-## Success Metrics
-
-| Phase | Criteria |
-|---|---|
-| Phase 1 (Wks 1–6) | System runs autonomously 7 days with zero manual intervention. At least 2 novel themes surfaced. Knowledge graph: >50 companies, >20 founders, >5 themes. |
-| Phase 2 (Mo 2–3) | Partner acts on at least 1 system-flagged theme. Founder Radar surfaces 3+ founders who subsequently announce fundraises. Active tracking of 5+ themes. |
-| Phase 3 (Mo 4–6) | Knowledge graph reaches critical mass (>200 companies, >100 founders, >15 themes). System surfaces pattern matches against portfolio history. Partners report measurable time savings. |
-
----
-
-## Future Extensions (Post-v1)
-
-### Agent 4 — Deal Diligence Agent
-Automates structured diligence when a pitch deck arrives: parses deck, scores team/market/product, flags anomalies, generates question list for partner meeting.
-
-### Agent 5 — Portfolio Pulse Agent
-Monitors portfolio companies via hiring velocity, news mentions, and GitHub activity — alerts partners to material changes.
-
-### Agent 6 — LP Communications Agent
-Auto-drafts quarterly LP letters and portfolio update memos using fund metrics and portfolio data.
-
-### Infrastructure Upgrade Path
-- Migrate from Supabase graph queries to Neo4j AuraDB when entity count exceeds ~500
-- Add CRM sync (Affinity or Salesforce) for relationship tracking and sourcing attribution
-- Build partner dashboard (Next.js) for visual knowledge graph exploration
-- Add role-based access control for multi-fund configurations
-
----
-
-## Technical Notes
-
-### On LLM Selection
-- **Long context window** (100k+ tokens) recommended for Orchestrator and Market Cartographer when synthesising large market maps
-- **Strong tool use** capabilities needed across all agents
-- **Cost optimisation:** use larger models for synthesis/reasoning; smaller models for classification tasks (e.g. "is this vaporware?")
-
-### On Data Quality
-The free-source stack produces lower fidelity company data than Crunchbase Pro. Mitigations:
-- YC batches cover early-stage companies well — supplement with AngelList public pages
-- OpenCorporates is best for geography and incorporation date, not sector classification
-- Prioritise signal volume over individual data point precision — patterns emerge from aggregation
-
-### On Scaling
-v1 is designed for a single fund with 1–3 partners. For multi-fund firms: shard by fund focus, implement row-level security in Supabase, and configure different signal weights per fund strategy.
-
----
-
-## Conclusion
-
-The Conviction Engine represents a shift from reactive deal processing to proactive thesis generation. By continuously scanning weak signals, mapping emerging markets, and tracking high-potential founders, it compresses the time between market emergence and investment conviction — the core source of alpha in venture capital.
-
-**Build order:** Start with Horizon Scanner → Market Cartographer → Founder Radar. Get that chain working end-to-end before adding complexity. The knowledge graph is the foundation — everything else compounds on top of it. The simplified infrastructure (Supabase only, no Pinecone or Neo4j) means the system is faster to stand up and cheaper to run while the graph seeds itself with real data.
+# Tech Insider Signal Strategy
+
+## Executive summary
+
+The Tech Insider Signal Strategy is a systematic, research-only paper trading
+model that monitors insider open-market purchases across a curated universe of
+50 large and liquid technology-related public companies. The core hypothesis is
+that open-market purchases by senior insiders may carry more signal than routine
+compensation-related transactions because the insider is voluntarily deploying
+personal capital into the issuer's equity. The strategy does not treat any
+single insider purchase as sufficient evidence on its own. Instead, it
+prioritizes clustered buying, larger disclosed purchase values, recency, and
+unusual trading-volume context.
+
+The strategy reads insider transaction data, filters for purchase transactions,
+groups purchases into 10-day windows by issuer, scores each issuer-level
+candidate, and paper-trades the highest-confidence names. Each new qualifying
+signal opens a $1,000 paper trade, and the digest highlights the top three
+current candidates. The current implementation is deliberately conservative in
+one respect and deliberately simple in another: it only acts on disclosed
+purchases, but it currently uses fixed-notional entries without an explicit exit
+rule, stop-loss rule, or portfolio-level risk budget.
+
+The model is designed as a signal laboratory rather than an autonomous trading
+system. The purpose is to observe whether insider purchase clusters in the
+technology universe are associated with attractive forward returns after
+accounting for filing delay, price movement, volume context, and benchmark
+performance. The strategy should not be treated as production capital
+allocation until additional research validates signal persistence, turnover,
+transaction costs, tax effects, exits, and robustness across market regimes.
+
+## Strategy objective
+
+The objective is to identify technology companies where disclosed insider
+purchases appear unusually informative. The model seeks signals with several
+reinforcing characteristics:
+
+- Multiple insiders buying within a short window.
+- A meaningful aggregate dollar value of disclosed purchases.
+- A recent filing or transaction date.
+- A trading-volume context that suggests market attention or abnormal activity.
+- A price series that can support paper execution and backtesting without
+  look-ahead bias.
+
+The strategy intentionally focuses on purchases rather than sales. Insider
+sales can occur for many non-informational reasons, including diversification,
+liquidity, tax planning, or scheduled trading plans. Insider purchases are
+narrower because the insider is using cash to increase exposure to the company.
+That does not make purchases automatically predictive, but it makes them a
+cleaner starting point for a systematic signal.
+
+## Regulatory and data foundation
+
+Corporate officers, directors, and beneficial owners of more than 10% of a
+registered class of equity securities are required to report holdings and
+transactions in company securities through Forms 3, 4, and 5
+([SEC investor bulletin on Forms 3, 4, and 5](https://www.sec.gov/files/forms-3-4-5.pdf)).
+In most cases, when an insider executes a reportable transaction, Form 4 must
+be filed within two business days and discloses details such as transaction
+amount and price per share. The strategy therefore treats Form 4 visibility as
+the practical decision point rather than the trade date, because a model cannot
+use a filing before it is public.
+
+The implementation uses the SEC EDGAR public APIs directly:
+
+- `https://www.sec.gov/files/company_tickers.json` — ticker → CIK mapping.
+- `https://data.sec.gov/submissions/CIK{cik}.json` — recent filings per issuer.
+- `https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/` — primary Form 4
+  XML documents.
+
+All three endpoints are free and require only a descriptive `User-Agent`
+header. Price and volume data are sourced through `yfinance`, which is also
+free and requires no API key.
+
+## Tradable universe
+
+The strategy currently monitors a fixed 50-name technology and
+technology-adjacent universe. The list is intentionally broad enough to include
+mega-cap platforms, semiconductors, infrastructure software, cybersecurity,
+data platforms, and selected tech-enabled marketplace or financial
+infrastructure names. The universe is not dynamically rebalanced and does not
+currently attempt to reconstruct historical index membership.
+
+| Ticker | Company |
+| --- | --- |
+| AAPL | Apple |
+| MSFT | Microsoft |
+| NVDA | NVIDIA |
+| GOOGL | Alphabet |
+| GOOG | Alphabet |
+| AMZN | Amazon |
+| META | Meta Platforms |
+| AVGO | Broadcom |
+| TSLA | Tesla |
+| NFLX | Netflix |
+| ORCL | Oracle |
+| AMD | Advanced Micro Devices |
+| CRM | Salesforce |
+| ADBE | Adobe |
+| CSCO | Cisco |
+| NOW | ServiceNow |
+| QCOM | Qualcomm |
+| INTU | Intuit |
+| IBM | IBM |
+| TXN | Texas Instruments |
+| AMAT | Applied Materials |
+| UBER | Uber |
+| SHOP | Shopify |
+| PANW | Palo Alto Networks |
+| ANET | Arista Networks |
+| MU | Micron |
+| LRCX | Lam Research |
+| ADI | Analog Devices |
+| KLAC | KLA |
+| SNPS | Synopsys |
+| CDNS | Cadence Design Systems |
+| CRWD | CrowdStrike |
+| PLTR | Palantir |
+| DELL | Dell Technologies |
+| ABNB | Airbnb |
+| ADP | ADP |
+| APH | Amphenol |
+| MRVL | Marvell |
+| FTNT | Fortinet |
+| TEAM | Atlassian |
+| WDAY | Workday |
+| DDOG | Datadog |
+| NET | Cloudflare |
+| ZS | Zscaler |
+| SNOW | Snowflake |
+| MDB | MongoDB |
+| OKTA | Okta |
+| ROKU | Roku |
+| COIN | Coinbase |
+| SQ | Block |
+
+The universe should be viewed as a first operating set, not a final research
+universe. The current list likely contains survivorship bias for historical
+testing because it uses companies that are relevant today rather than companies
+that would have been selected using only information available at each
+historical point in time. A professional-grade future version should support
+point-in-time universe construction, delisted names, corporate actions, and
+historical liquidity filters.
+
+## Signal definition
+
+### Eligible transaction type
+
+An eligible signal begins with an insider transaction whose transaction code
+starts with `P` (open-market purchase), with positive reported value, positive
+reported price, a valid ticker, and a valid reporting owner. The model excludes
+transactions that do not look like open-market purchases, transactions without
+usable value or price information, and transactions whose data cannot be mapped
+to a monitored ticker.
+
+The strategy currently does not incorporate sales, option exercises, gifts,
+derivative conversions, or equity grants. This makes the signal narrower and
+easier to interpret, but it also excludes potentially relevant behavior such as
+insiders exercising and holding shares or avoiding discretionary sales.
+
+### Grouping window
+
+Purchases are grouped by ticker into 10-day windows. Within each issuer, the
+model searches for the strongest recent purchase cluster by comparing:
+
+- The number of distinct insiders in the window.
+- The aggregate disclosed purchase value in the window.
+- The number of purchase transactions in the window.
+- The latest transaction and filing dates in the window.
+
+For live signals, the model evaluates recent transaction data and selects the
+strongest candidate window per issuer. For the historical backtest, it walks
+through purchases chronologically and avoids repeatedly counting overlapping
+10-day clusters as separate independent signals.
+
+### Minimum signal quality
+
+The historical backtest rejects weak events before scoring if they do not
+satisfy at least one of these criteria:
+
+- At least two distinct insiders bought within the 10-day event window.
+- Aggregate purchase value was at least $100,000.
+
+The backtest then requires a confidence score of at least 40 out of 100. Live
+monitoring ranks candidate signals and highlights the top three current names,
+but the backtest applies the explicit score floor to avoid filling the
+historical portfolio with low-quality noise.
+
+## Confidence scoring
+
+The confidence score is a heuristic composite, not a trained statistical
+probability. A score of 60 should not be interpreted as a 60% probability of
+positive return. It is a ranking score that combines cluster intensity, dollar
+value, volume context, and either recency or the historical event baseline.
+
+### Live signal score
+
+For live monitoring, the score is:
+
+`confidence = min(100, cluster_score + value_score + volume_score + recency_score)`
+
+| Component     | Formula                                              | Cap | Interpretation |
+| ---           | ---                                                  | --: | --- |
+| Cluster score | `distinct_insiders * 12 + additional_transactions * 3` |  35 | Rewards multiple insiders and repeated purchases. |
+| Value score   | `log10(total_purchase_value) * 4`                    |  25 | Rewards larger disclosed dollar commitment with diminishing returns. |
+| Volume score  | `max(0, volume_z_score) * 6`                         |  20 | Rewards unusually high recent volume only when above baseline. |
+| Recency score | `20 - recency_days / 2`, floored at 0                |  20 | Rewards newer transaction windows. |
+
+The live model uses a 20-day average volume baseline and sample standard
+deviation to calculate volume z-score. Positive z-scores add to confidence,
+while below-baseline volume does not penalize the score.
+
+### Historical backtest score
+
+For historical replay, the score is:
+
+`confidence = min(100, cluster_score + value_score + volume_score + 20)`
+
+The backtest uses a fixed 20-point base score instead of a live recency score
+because every historical event is evaluated at its simulated decision date.
+
+### Rationale text
+
+Each signal produces a human-readable rationale that summarizes the main
+drivers. The rationale includes:
+
+- Number of distinct insiders.
+- Number of open-market purchase transactions.
+- Disclosed aggregate purchase value.
+- Volume anomaly language if volume is more than 1.5 standard deviations above
+  the 20-day baseline.
+- Cluster flag language if at least two insiders bought.
+
+## Volume context
+
+Volume is not the core signal. It is a contextual overlay designed to identify
+cases where insider buying coincides with unusually elevated market activity.
+The model calculates:
+
+`volume_z_score = (current_volume - trailing_20d_average) / trailing_20d_stdev`
+
+A positive volume z-score increases confidence up to a maximum contribution of
+20 points. A negative z-score is shown in the digest but does not reduce the
+confidence score.
+
+## Paper portfolio rules
+
+The paper portfolio is intentionally simple:
+
+- Each new top-three signal opens a new $1,000 paper trade.
+- The entry price is the latest available price at the time the signal opens.
+- The model does not place real brokerage orders.
+- The model does not pyramid into an issuer if there is already an open paper
+  position in the same ticker.
+- Existing positions are marked to the latest price update available through
+  the refresh process.
+
+The paper portfolio is therefore a signal-tracking ledger rather than a fully
+specified portfolio management strategy.
+
+## Daily operating workflow
+
+The recurring workflow is configured to run on weekdays before the U.S. market
+opens. Each run:
+
+1. Refreshes insider transactions, signal scores, volume context, and paper
+   positions.
+2. Ranks the latest signals by confidence.
+3. Prints the top three candidates and the open paper portfolio to the
+   terminal.
+
+Email delivery has been intentionally deferred. Output is currently
+terminal-only.
+
+## Backtesting methodology
+
+The backtest begins on 2020-01-01 and replays qualifying historical purchase
+signals for the monitored universe. It uses a one-trading-day censor gap after
+filing visibility before entering a simulated trade.
+
+Each historical signal opens a fresh $1,000 trade. The backtest starts with
+$10,000 of initial capital and treats every $1,000 signal trade as an external
+capital contribution.
+
+To address the cash-flow benchmarking challenge, the backtest reports two
+benchmark views:
+
+- Unitized NAV comparison: strategy and S&P 500 proxy compared as index series
+  using time-weighted returns.
+- Cash-flow-matched benchmark: the S&P 500 proxy receives the same $10,000
+  initial capital and the same $1,000 contribution on every strategy signal
+  date.
+
+## Backtest outputs
+
+| Metric | Purpose |
+| --- | --- |
+| Strategy NAV return | Contribution-neutral return of the insider signal strategy. |
+| S&P 500 index return | Same-period benchmark index return. |
+| Excess NAV return | Strategy NAV return minus benchmark index return. |
+| Strategy value | Current simulated portfolio value including open holdings and cash. |
+| Matched S&P 500 value | Value of the cash-flow-matched benchmark portfolio. |
+| Net strategy P&L | Current strategy value minus all contributed capital. |
+| Strategy IRR | Money-weighted annualized return based on strategy cash flows. |
+| Matched S&P 500 IRR | Money-weighted annualized return using the same cash-flow dates. |
+| IRR alpha | Strategy IRR minus matched benchmark IRR. |
+| Total trades | Number of historical signal trades executed. |
+| Profitable trades | Number and percentage of trades currently above entry. |
+| Average trade return | Simple average return across historical signal trades. |
+| Total trade capital | Aggregate $1,000 notional deployed. |
+| Open trade value | Current gross market value of historical signal trades. |
+| NAV max drawdown | Maximum drawdown of the unitized NAV curve. |
+
+The trade blotter shows individual trade details, including ticker, company,
+entry date, entry price, notional, confidence, insider count, disclosed
+purchase value, current value, P&L, P&L percentage, and holding days.
+
+## Current limitations
+
+### Signal limitations
+
+- Purchase intent is not observable.
+- The model does not normalize purchase size by insider wealth or compensation.
+- The model does not weight CEO or CFO purchases above director or 10% owner
+  purchases.
+- The model does not adjust for an insider's historical buying record.
+- The model does not classify company news around the filing date.
+
+### Backtest limitations
+
+- The universe is fixed and may suffer survivorship bias.
+- Delisted companies are not included.
+- Transaction costs, bid-ask spreads, slippage, market impact, and taxes are
+  not modeled.
+- There is no exit rule.
+- No sector or factor exposure caps.
+
+### Operational limitations
+
+- yfinance occasionally rate-limits or returns gaps for thinly traded tickers.
+- SEC EDGAR requires a descriptive User-Agent and applies a soft 10 req/s
+  limit; the implementation respects this.
+- If SEC filing schemas change the parser may need updating.
+
+## Recommended research roadmap
+
+### Stage one: Make the signal more economically precise
+
+- Purchase value as a percentage of prior holdings.
+- Purchase value relative to reported annual compensation where available.
+- Insider role weighting for CEO, CFO, founder, director, and 10% owner.
+- Historical insider behavior by person and issuer.
+- Repeated buyer detection.
+
+### Stage two: Add exit and holding-period research
+
+- Fixed holding periods of 30, 60, 90, 180, and 252 trading days.
+- Exit after subsequent insider sales.
+- Exit after earnings release.
+- Exit when signal confidence decays below a threshold.
+- Exit when the stock reaches a predefined excess-return target or drawdown
+  limit.
+
+### Stage three: Improve benchmark and factor attribution
+
+- Nasdaq 100 proxy.
+- Technology sector ETF proxy.
+- Equal-weight tech universe benchmark.
+- Size, momentum, quality, and beta attribution.
+
+### Stage four: Add statistical validation
+
+- Forward return buckets by confidence decile.
+- Hit rate by holding period.
+- T-statistics and bootstrap confidence intervals.
+- Walk-forward testing and out-of-sample period separation.
+
+## Governance and compliance posture
+
+The strategy uses public filings and structured market data. It does not seek,
+use, or infer material nonpublic information. It should remain framed as a
+public-information research tool. Outputs are for research and paper trading
+only.
+
+## Bottom line
+
+The strategy is a starting point for a systematic insider-buying research
+workflow. Its strengths are a clear public-data foundation, a focused signal
+definition, cluster-aware scoring, fixed-notional paper execution, and a
+backtest presentation using unitized NAV and cash-flow-matched benchmarking.
+Its main weaknesses are the lack of exits, survivorship bias, limited role
+weighting, no transaction-cost model, and no statistical validation of the
+confidence score.
+
+This is research and analysis only, not personalized financial advice. Consult
+a qualified financial advisor before making investment decisions.
